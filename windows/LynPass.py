@@ -1,12 +1,8 @@
-#!/usr/bin/env python3
-# LynPass.py — 军工级本地密码管理器（最终完整修复版）
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, Menu
 import json, os, uuid, struct, secrets, string, hashlib, hmac, time, sys, ctypes
 from datetime import datetime, timezone
-import pyperclip
 
-# ======================== 兼容性导入 ========================
 try:
     from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
     HAS_ARGON2 = True
@@ -15,18 +11,27 @@ except ImportError:
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# ======================== 常量 ========================
+import pyperclip
+try:
+    import win32clipboard
+    HAS_WIN32CLIP = True
+except ImportError:
+    HAS_WIN32CLIP = False
+
 MAGIC = b'LYNX'
-VERSION = 3                     # 支持审计密钥
+VERSION = 3
 SALT_LEN = 16
 NONCE_LEN = 12
 KEY_LEN = 32
 HMAC_LEN = 32
-MAX_ATTEMPTS = 10               # 自毁阈值
-LOCKOUT_TIME = 15 * 60          # 防爆破锁 15 分钟
-SAFE_LOCKOUT = 24 * 3600        # 锁文件缺失/损坏的安全锁定时长
+AUTO_LOCK_TIME = 60                # 秒
 
-# ======================== 安全内存 ========================
+DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_LOCKOUT_TIME = 15          # 分钟
+DEFAULT_ON_MAX_ACTION = 'lock'
+SAFE_LOCKOUT = 24 * 3600           # 锁文件缺失时的强制锁定时间（秒）
+
+# -------------------- 安全内存 --------------------
 def secure_wipe(byte_array):
     if byte_array is None: return
     for i in range(len(byte_array)):
@@ -35,7 +40,6 @@ def secure_wipe(byte_array):
     ctypes.memset(addr, 0, len(byte_array))
 
 def try_mlock(byte_array):
-    """尝试锁定物理内存，返回是否成功"""
     try:
         addr = ctypes.addressof(ctypes.c_char.from_buffer(byte_array))
         length = len(byte_array)
@@ -48,10 +52,9 @@ def try_mlock(byte_array):
             if libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(length)) != 0:
                 return False
         return True
-    except Exception:
+    except:
         return False
 
-# ======================== 防截屏 ========================
 if sys.platform == 'win32':
     WDA_MONITOR = 1
     def prevent_screenshot(hwnd):
@@ -59,14 +62,11 @@ if sys.platform == 'win32':
 else:
     def prevent_screenshot(hwnd): pass
 
-# ======================== 虚拟键盘 ========================
 class VirtualKeyboard(tk.Toplevel):
     def __init__(self, parent, target_var):
         super().__init__(parent)
-        self.title('安全输入')
-        self.target = target_var
-        self.resizable(False, False)
-        self.attributes('-topmost', True)
+        self.title('安全输入'); self.target = target_var
+        self.resizable(False, False); self.attributes('-topmost', True)
         chars = '1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()'
         for i, ch in enumerate(chars):
             btn = ttk.Button(self, text=ch, width=3, command=lambda c=ch: self._type(c))
@@ -74,38 +74,24 @@ class VirtualKeyboard(tk.Toplevel):
     def _type(self, char):
         self.target.set(self.target.get() + char)
 
-# ======================== 密码学核心 ========================
+# -------------------- 密码学核心 --------------------
 def derive_keys(password: bytes, salt: bytes, dklen=64) -> bytes:
-    """
-    密钥派生：优先 Argon2id (256 MiB)，失败则回退 scrypt 降级尝试
-    最终保证在任何系统上都能运行（牺牲部分强度但可控）
-    """
     if HAS_ARGON2:
         try:
-            # 尝试新版 cryptography 参数
             kdf = Argon2id(salt=salt, length=dklen, memory_cost=256*1024,
-                          parallelism=4, time_cost=3)
+                           parallelism=4, time_cost=3)
             return kdf.derive(password)
         except TypeError:
             try:
-                # 旧版可能使用 degree_of_parallelism
                 kdf = Argon2id(salt=salt, length=dklen, memory_cost=256*1024,
-                              degree_of_parallelism=4, time_cost=3)
+                               degree_of_parallelism=4, time_cost=3)
                 return kdf.derive(password)
-            except TypeError:
-                pass  # 都不支持，回退
-    # 回退 scrypt，尝试从强到弱，直到成功
-    scrypt_configs = [
-        (2**17, 8, 1),   # 128 MiB
-        (2**16, 8, 1),   #  64 MiB
-        (2**15, 8, 1),   #  32 MiB
-    ]
+            except TypeError: pass
+    scrypt_configs = [(2**17, 8, 1), (2**16, 8, 1), (2**15, 8, 1)]
     for n, r, p in scrypt_configs:
         try:
             return hashlib.scrypt(password, salt=salt, n=n, r=r, p=p, dklen=dklen)
-        except ValueError:
-            continue
-    # 最终降级（仍然安全但较低内存）
+        except ValueError: continue
     return hashlib.scrypt(password, salt=salt, n=2**14, r=8, p=1, dklen=dklen)
 
 def encrypt_vault(password: bytes, data: dict) -> bytes:
@@ -150,30 +136,67 @@ def atomic_save(filepath: str, password: bytes, data: dict):
     os.replace(tmp, filepath)
     os.chmod(filepath, 0o600)
 
-# ======================== 审计日志（独立密钥） ========================
-AUDIT_MAGIC = b'LAUD'
-def encrypt_audit_entry(entry: dict, audit_key: bytes) -> bytes:
+# -------------------- 安全锁文件（独立，不参与互斥） --------------------
+LOCK_FILE = '.vault.lock'
+
+def _lock_static_key(vault_file: str) -> bytes:
+    seed = (vault_file + "#LOCK#SALT").encode('utf-8')
+    return hashlib.sha256(seed).digest()
+
+def _make_hidden(path):
+    if sys.platform == 'win32':
+        try: ctypes.windll.kernel32.SetFileAttributesW(path, 2)
+        except: pass
+
+def load_lock_state(vault_file: str):
+    """读取安全锁状态，文件缺失/损坏返回强制锁定"""
+    if not os.path.exists(LOCK_FILE):
+        return (999, time.time() + SAFE_LOCKOUT, DEFAULT_MAX_ATTEMPTS, DEFAULT_ON_MAX_ACTION)
+    try:
+        with open(LOCK_FILE, 'rb') as f:
+            data = f.read()
+        salt = data[:SALT_LEN]
+        nonce = data[SALT_LEN:SALT_LEN+NONCE_LEN]
+        ct = data[SALT_LEN+NONCE_LEN:]
+        key = _lock_static_key(vault_file)
+        aesgcm = AESGCM(key)
+        plain = aesgcm.decrypt(nonce, ct, None)
+        state = json.loads(plain.decode('utf-8'))
+        return (
+            state.get('attempts', 0),
+            state.get('lock_until', 0),
+            state.get('max_attempts', DEFAULT_MAX_ATTEMPTS),
+            state.get('action', DEFAULT_ON_MAX_ACTION)
+        )
+    except Exception:
+        return (999, time.time() + SAFE_LOCKOUT, DEFAULT_MAX_ATTEMPTS, DEFAULT_ON_MAX_ACTION)
+
+def update_lock_file(vault_file, attempts, lock_until, max_attempts=None, action=None):
+    """原子写入安全锁文件（不加文件锁，调用前需确保已持有运行锁）"""
+    if max_attempts is None: max_attempts = DEFAULT_MAX_ATTEMPTS
+    if action is None: action = DEFAULT_ON_MAX_ACTION
+    salt = os.urandom(SALT_LEN)
+    key = _lock_static_key(vault_file)
+    data = json.dumps({
+        'attempts': attempts, 'lock_until': lock_until,
+        'max_attempts': max_attempts, 'action': action
+    }).encode('utf-8')
+    aesgcm = AESGCM(key)
     nonce = os.urandom(NONCE_LEN)
-    plain = json.dumps(entry).encode('utf-8')
-    aesgcm = AESGCM(audit_key)
-    ct = aesgcm.encrypt(nonce, plain, None)
-    return AUDIT_MAGIC + nonce + ct
+    ct = aesgcm.encrypt(nonce, data, None)
+    new_content = salt + nonce + ct
+    tmp = LOCK_FILE + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(new_content); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, LOCK_FILE)
+    os.chmod(LOCK_FILE, 0o600)
+    _make_hidden(LOCK_FILE)
 
-def decrypt_audit_entry(data: bytes, audit_key: bytes) -> dict:
-    if data[:4] != AUDIT_MAGIC: raise ValueError('无效审计条目')
-    nonce = data[4:4+NONCE_LEN]
-    ct = data[4+NONCE_LEN:]
-    aesgcm = AESGCM(audit_key)
-    plain = aesgcm.decrypt(nonce, ct, None)
-    return json.loads(plain.decode('utf-8'))
+def clear_lock_state():
+    if os.path.exists(LOCK_FILE):
+        try: os.remove(LOCK_FILE)
+        except: pass
 
-def audit_log(event: str, audit_key: bytes):
-    entry = {'ts': time.time(), 'event': event}
-    encrypted = encrypt_audit_entry(entry, audit_key)
-    with open('audit.log.enc', 'ab') as f:
-        f.write(encrypted + b'\n')
-
-# ======================== 自毁 ========================
 def self_destruct(vault_file):
     if not os.path.exists(vault_file): return
     size = os.path.getsize(vault_file)
@@ -182,85 +205,37 @@ def self_destruct(vault_file):
             f.seek(0); f.write(os.urandom(size)); f.flush(); os.fsync(f.fileno())
     os.remove(vault_file)
 
-# ======================== 加密锁文件（防篡改） ========================
-def get_lock_file(vault_file): return vault_file + '.lock'
+# -------------------- 运行锁（并发控制，独立文件，可自动回收） --------------------
+RUNNING_FILE = 'vault.pass.running'
 
-def _lock_data_key(password: bytes, salt: bytes) -> bytes:
-    return derive_keys(password, salt, dklen=32)[:32]
-
-def save_lock_state(vault_file, attempts, lock_until, password: bytes):
-    salt = os.urandom(SALT_LEN)
-    key = _lock_data_key(password, salt)
-    data = {'attempts': attempts, 'lock_until': lock_until}
-    plain = json.dumps(data).encode('utf-8')
-    aesgcm = AESGCM(key)
-    nonce = os.urandom(NONCE_LEN)
-    ct = aesgcm.encrypt(nonce, plain, None)
-    with open(get_lock_file(vault_file), 'wb') as f:
-        f.write(salt + nonce + ct)
-    os.chmod(get_lock_file(vault_file), 0o600)
-
-def load_lock_state(vault_file, password: bytes):
-    """返回 (attempts, lock_until)；若文件缺失或损坏返回 (None, None)"""
-    lock_file = get_lock_file(vault_file)
-    if not os.path.exists(lock_file):
-        return None, None
-    try:
-        with open(lock_file, 'rb') as f:
-            raw = f.read()
-        salt = raw[:SALT_LEN]
-        nonce = raw[SALT_LEN:SALT_LEN+NONCE_LEN]
-        ct = raw[SALT_LEN+NONCE_LEN:]
-        key = _lock_data_key(password, salt)
-        aesgcm = AESGCM(key)
-        plain = aesgcm.decrypt(nonce, ct, None)
-        data = json.loads(plain.decode('utf-8'))
-        return data['attempts'], data['lock_until']
-    except Exception:
-        # 损坏视为入侵，进入长期锁定
-        return MAX_ATTEMPTS, time.time() + SAFE_LOCKOUT
-
-def clear_lock(vault_file):
-    lock_file = get_lock_file(vault_file)
-    if os.path.exists(lock_file):
-        os.remove(lock_file)
-
-def is_locked(vault_file, password: bytes):
-    attempts, lock_until = load_lock_state(vault_file, password)
-    if attempts is None: return False, 0
-    if attempts >= MAX_ATTEMPTS and time.time() < lock_until:
-        return True, int(lock_until - time.time())
-    return False, 0
-
-def record_failed_attempt(vault_file, password: bytes):
-    attempts, lock_until = load_lock_state(vault_file, password)
-    if attempts is None: attempts = 0
-    attempts += 1
-    if attempts >= MAX_ATTEMPTS:
-        lock_until = time.time() + LOCKOUT_TIME
-    save_lock_state(vault_file, attempts, lock_until, password)
-
-# ======================== 并发锁（改进） ========================
 if sys.platform == 'win32':
     import msvcrt
-    def acquire_running_lock(vault_file):
-        path = vault_file + '.running'
+    def acquire_running_lock():
+        """获取运行锁，成功返回文件句柄，失败返回 None（已有实例或权限问题）"""
+        path = RUNNING_FILE
         try:
-            f = open(path, 'w')
+            # 打开或创建文件并尝试非阻塞锁
+            f = open(path, 'a+b')   # 追加模式，确保文件存在且可写
             msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
             return f
         except (IOError, OSError):
+            # 文件可能被其他进程独占，或权限不足
             return None
     def release_running_lock(f):
         try: msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         except: pass
         f.close()
+        try:
+            # 清理运行锁文件（仅当无其他进程持锁时，但实际我们已经释放锁，可以安全删除）
+            if os.path.exists(RUNNING_FILE):
+                os.remove(RUNNING_FILE)
+        except: pass
 else:
     import fcntl
-    def acquire_running_lock(vault_file):
-        path = vault_file + '.running'
+    def acquire_running_lock():
+        path = RUNNING_FILE
         try:
-            f = open(path, 'w')
+            f = open(path, 'a+b')
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return f
         except (BlockingIOError, OSError):
@@ -268,8 +243,27 @@ else:
     def release_running_lock(f):
         fcntl.flock(f, fcntl.LOCK_UN)
         f.close()
+        try:
+            if os.path.exists(RUNNING_FILE):
+                os.remove(RUNNING_FILE)
+        except: pass
 
-# ======================== 密码生成器 ========================
+# -------------------- 审计日志 --------------------
+AUDIT_MAGIC = b'LAUD'
+def encrypt_audit_entry(entry: dict, audit_key: bytes) -> bytes:
+    nonce = os.urandom(NONCE_LEN)
+    plain = json.dumps(entry).encode('utf-8')
+    aesgcm = AESGCM(audit_key)
+    ct = aesgcm.encrypt(nonce, plain, None)
+    return AUDIT_MAGIC + nonce + ct
+
+def audit_log(event: str, audit_key: bytes):
+    entry = {'ts': time.time(), 'event': event}
+    encrypted = encrypt_audit_entry(entry, audit_key)
+    with open('audit.log.enc', 'ab') as f:
+        f.write(encrypted + b'\n')
+
+# -------------------- 密码生成器 --------------------
 def generate_password(length=16, use_symbols=True, exclude_confusing=False):
     lowers = string.ascii_lowercase; uppers = string.ascii_uppercase; digits = string.digits
     symbols = "!@#$%^&*()-_=+[]{}|;:,.<>?"
@@ -286,7 +280,7 @@ def generate_password(length=16, use_symbols=True, exclude_confusing=False):
     secrets.SystemRandom().shuffle(password)
     return ''.join(password)
 
-# ======================== 界面工具 ========================
+# -------------------- 界面工具 --------------------
 def center_window(win, parent=None, width=None, height=None):
     if width and height: win.geometry(f'{width}x{height}')
     win.update_idletasks()
@@ -305,7 +299,7 @@ def set_icon(window):
         try: window.iconbitmap('icon.ico')
         except: pass
 
-# ======================== 登录窗口 ========================
+# -------------------- 登录窗口 --------------------
 class MilitaryLoginWindow:
     def __init__(self, parent, vault_file='vault.pass'):
         self.parent = parent; self.vault_file = vault_file
@@ -317,12 +311,20 @@ class MilitaryLoginWindow:
         set_icon(self.win)
 
         if not os.path.exists(vault_file):
-            clear_lock(vault_file)
+            clear_lock_state()
             self.build_create_ui()
             center_window(self.win, parent, 420, 260)
             self.win.after(100, lambda: prevent_screenshot(self.win.winfo_id()))
             self.win.focus()
             return
+
+        # 检查安全锁状态
+        lock_state = load_lock_state(vault_file)
+        _, lock_until, _, _ = lock_state
+        if lock_until > time.time():
+            mins, secs = divmod(int(lock_until - time.time()), 60)
+            messagebox.showwarning('已锁定', f'保险库已锁定，请等待 {mins} 分 {secs} 秒后重试。')
+            self.on_close(); return
 
         self.build_login_ui()
         center_window(self.win, parent, 420, 260)
@@ -370,17 +372,26 @@ class MilitaryLoginWindow:
             self.status_label.config(text='密码至少需要8个字符'); return
         if pwd1 != pwd2:
             self.status_label.config(text='两次输入的密码不一致'); return
-        audit_key = secrets.token_bytes(32)   # 随机审计密钥
-        data = {'entries': [], 'audit_key': None}
+        audit_key = secrets.token_bytes(32)
+        data = {
+            'entries': [],
+            'audit_key': None,
+            'settings': {
+                'max_attempts': DEFAULT_MAX_ATTEMPTS,
+                'lockout_time': DEFAULT_LOCKOUT_TIME,
+                'on_max_action': DEFAULT_ON_MAX_ACTION
+            }
+        }
         pwd_bytes = bytearray(pwd1.encode('utf-8'))
         mlock_ok = try_mlock(pwd_bytes)
-        # 加密审计密钥并存入保险库
         enc_audit = encrypt_vault(bytes(pwd_bytes), {'audit_key': audit_key.hex()})
         data['audit_key'] = enc_audit.hex()
         try:
             atomic_save(self.vault_file, bytes(pwd_bytes), data)
         except Exception as e:
             messagebox.showerror('错误', f'创建失败：{e}'); return
+        # 创建安全锁文件（初始正常状态）
+        update_lock_file(self.vault_file, 0, 0, DEFAULT_MAX_ATTEMPTS, DEFAULT_ON_MAX_ACTION)
         self.master_pwd = pwd_bytes
         self.data = data
         self.audit_key = audit_key
@@ -391,51 +402,58 @@ class MilitaryLoginWindow:
     def unlock(self):
         pwd = self.pwd_var.get()
         if not pwd: self.status_label.config(text='请输入密码'); return
-
         pwd_bytes = bytearray(pwd.encode('utf-8'))
-        mlock_ok = try_mlock(pwd_bytes)
 
-        # 检查锁定状态（需密码解密锁文件）
-        locked, remaining = is_locked(self.vault_file, bytes(pwd_bytes))
-        if locked:
-            mins, secs = divmod(remaining, 60)
-            messagebox.showwarning('已锁定', f'账户已锁定。\n请等待 {mins} 分 {secs} 秒后重试。')
-            return
+        # 再次检查安全锁
+        lock_state = load_lock_state(self.vault_file)
+        _, lock_until, max_attempts, action = lock_state
+        if lock_until > time.time():
+            mins, secs = divmod(int(lock_until - time.time()), 60)
+            messagebox.showwarning('已锁定', f'保险库已锁定，请等待 {mins} 分 {secs} 秒后重试。')
+            self.win.destroy(); self.parent.destroy(); return
 
         try:
             with open(self.vault_file, 'rb') as f: raw = f.read()
             vault_data = decrypt_vault(bytes(pwd_bytes), raw)
-            # 提取审计密钥
             enc_audit = bytes.fromhex(vault_data['audit_key'])
             audit_plain = decrypt_vault(bytes(pwd_bytes), enc_audit)
             audit_key = bytes.fromhex(audit_plain['audit_key'])
-            clear_lock(self.vault_file)   # 成功后清除锁
+            # 成功，重置安全锁
+            update_lock_file(self.vault_file, 0, 0, max_attempts, action)
         except Exception:
-            record_failed_attempt(self.vault_file, bytes(pwd_bytes))
-            attempts, _ = load_lock_state(self.vault_file, bytes(pwd_bytes))
-            if attempts is not None and attempts >= MAX_ATTEMPTS:
+            attempts, _, _, _ = lock_state
+            attempts += 1
+            if attempts >= max_attempts:
+                if action == 'destroy':
+                    update_lock_file(self.vault_file, attempts, 0, max_attempts, action)
+                    secure_wipe(pwd_bytes)
+                    self_destruct(self.vault_file)
+                    clear_lock_state()
+                    messagebox.showerror('已销毁', '连续错误次数过多，保险库已永久销毁！')
+                else:
+                    lock_until = time.time() + DEFAULT_LOCKOUT_TIME * 60
+                    update_lock_file(self.vault_file, attempts, lock_until, max_attempts, action)
+                    secure_wipe(pwd_bytes)
+                    messagebox.showerror('已锁定', f'连续错误次数过多，保险库已锁定 {DEFAULT_LOCKOUT_TIME} 分钟。')
+            else:
+                update_lock_file(self.vault_file, attempts, 0, max_attempts, action)
                 secure_wipe(pwd_bytes)
-                self_destruct(self.vault_file)
-                messagebox.showwarning('已销毁', '连续错误次数过多，保险库已永久销毁！')
-                self.on_close()
-                return
-            remaining_attempts = MAX_ATTEMPTS - (attempts or 0)
-            self.status_label.config(text=f'密码错误！剩余尝试次数：{remaining_attempts}')
-            return
+                messagebox.showerror('错误', '密码错误，程序退出。')
+            self.win.destroy(); self.parent.destroy(); return
 
         self.master_pwd = pwd_bytes
         self.data = vault_data
         self.audit_key = audit_key
-        self.mlock_ok = mlock_ok
+        self.mlock_ok = try_mlock(pwd_bytes)
         audit_log('保险库解锁', audit_key)
         self.win.destroy()
 
-# ======================== 主窗口 ========================
+# -------------------- 主窗口（右键菜单） --------------------
 class MilitaryMainWindow:
-    def __init__(self, parent, vault_file, data, master_pwd, audit_key, mlock_ok, running_lock):
+    def __init__(self, parent, vault_file, data, master_pwd, audit_key, mlock_ok):
         self.parent = parent; self.vault_file = vault_file; self.data = data
         self.master_pwd = master_pwd; self.audit_key = audit_key
-        self.mlock_ok = mlock_ok; self.running_lock = running_lock
+        self.mlock_ok = mlock_ok
         self.root = tk.Toplevel(parent)
         self.root.title('LynPass')
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -457,7 +475,7 @@ class MilitaryMainWindow:
         self._reset_auto_lock()
     def _reset_auto_lock(self, event=None):
         if self._auto_lock_id: self.root.after_cancel(self._auto_lock_id)
-        self._auto_lock_id = self.root.after(60000, self._auto_lock)
+        self._auto_lock_id = self.root.after(AUTO_LOCK_TIME * 1000, self._auto_lock)
     def _auto_lock(self):
         self._auto_lock_id = None
         self.lock()
@@ -482,13 +500,14 @@ class MilitaryMainWindow:
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
         self.tree.pack(expand=True, fill='both', padx=10)
-        self.tree.bind('<Button-1>', self.on_click_action)
+        self.tree.bind('<Button-3>', self.show_context_menu)
 
         bf = ttk.Frame(self.root); bf.pack(fill='x', padx=10, pady=10)
         ttk.Button(bf, text='+ 添加', command=self.add_entry).pack(side='left', padx=4)
         ttk.Button(bf, text='✎ 编辑', command=self.edit_entry).pack(side='left', padx=4)
         ttk.Button(bf, text='✕ 删除', command=self.delete_entry).pack(side='left', padx=4)
         ttk.Button(bf, text='🔑 生成器', command=self.open_generator).pack(side='left', padx=4)
+        ttk.Button(bf, text='🛡 安全设置', command=self.open_settings).pack(side='left', padx=4)
         ttk.Button(bf, text='修改主密码', command=self.change_master_password).pack(side='left', padx=4)
         ttk.Button(bf, text='锁定', command=self.lock).pack(side='right', padx=4)
 
@@ -500,32 +519,55 @@ class MilitaryMainWindow:
         q = self.search_var.get().lower()
         for idx, e in enumerate(self.data['entries']):
             if q and q not in e['site'].lower() and q not in e['username'].lower(): continue
-            self.tree.insert('', 'end', iid=str(idx), values=(e['site'], e['username'], '********', '👁 📋'))
+            self.tree.insert('', 'end', iid=str(idx), values=(e['site'], e['username'], '********', '右键菜单'))
 
-    def on_click_action(self, event):
-        if self.tree.identify_region(event.x, event.y) != 'cell': return
-        col = self.tree.identify_column(event.x)
+    def show_context_menu(self, event):
         row = self.tree.identify_row(event.y)
         if not row: return
         idx = int(row)
-        if col == '#4':
-            x_in_cell = event.x - self.tree.bbox(row, col)[0]
-            if x_in_cell < 50: self.toggle_show(idx)
-            else: self.copy_to_clipboard(self.data['entries'][idx]['password'])
+        entry = self.data['entries'][idx]
+        menu = Menu(self.root, tearoff=0)
+        menu.add_command(label='复制密码', command=lambda: self.copy_to_clipboard(entry['password']))
+        menu.add_command(label='显示密码 (5秒)', command=lambda: self.toggle_show(idx))
+        menu.post(event.x_root, event.y_root)
 
     def toggle_show(self, idx):
-        pw = self.data['entries'][idx]['password']
-        self.tree.set(str(idx), 'password', pw)
+        entry = self.data['entries'][idx]
+        self.tree.set(str(idx), 'password', entry['password'])
         self.root.after(5000, lambda: self.tree.set(str(idx), 'password', '********'))
 
     def copy_to_clipboard(self, text):
-        pyperclip.copy(text)
-        if self._clipboard_clear_id: self.root.after_cancel(self._clipboard_clear_id)
-        self._clipboard_clear_id = self.root.after(15000, self._clear_clipboard)
-        messagebox.showinfo('复制成功', '密码已复制到剪贴板，15秒后自动清除')
+        success = False
+        try: pyperclip.copy(text); success = True
+        except: pass
+        if not success:
+            try:
+                self.root.clipboard_clear(); self.root.clipboard_append(text); success = True
+            except: pass
+        if not success and HAS_WIN32CLIP and sys.platform == 'win32':
+            try:
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text)
+                win32clipboard.CloseClipboard()
+                success = True
+            except: pass
+        if success:
+            if self._clipboard_clear_id: self.root.after_cancel(self._clipboard_clear_id)
+            self._clipboard_clear_id = self.root.after(15000, self._clear_clipboard)
+            messagebox.showinfo('复制成功', '密码已复制到剪贴板，15秒后自动清除')
+        else:
+            messagebox.showwarning('复制失败', '无法访问剪贴板，请手动复制以下密码：\n\n' + text)
+
     def _clear_clipboard(self):
         try: pyperclip.copy('')
         except: pass
+        try: self.root.clipboard_clear()
+        except: pass
+        if HAS_WIN32CLIP and sys.platform == 'win32':
+            try:
+                win32clipboard.OpenClipboard(); win32clipboard.EmptyClipboard(); win32clipboard.CloseClipboard()
+            except: pass
 
     def add_entry(self):
         dialog = EntryDialog(self.root, '添加密码')
@@ -560,10 +602,21 @@ class MilitaryMainWindow:
     def save(self):
         enc_audit = encrypt_vault(bytes(self.master_pwd), {'audit_key': self.audit_key.hex()})
         self.data['audit_key'] = enc_audit.hex()
+        if 'settings' not in self.data:
+            self.data['settings'] = {}
+        lock_state = load_lock_state(self.vault_file)
+        if lock_state:
+            _, _, max_attempts, action = lock_state
+            self.data['settings']['max_attempts'] = max_attempts
+            self.data['settings']['on_max_action'] = action
         atomic_save(self.vault_file, bytes(self.master_pwd), self.data)
 
     def open_generator(self):
         gen = GeneratorWindow(self.root); self.root.wait_window(gen)
+
+    def open_settings(self):
+        dialog = SecuritySettingsDialog(self.root, self.vault_file)
+        self.root.wait_window(dialog)
 
     def change_master_password(self):
         dialog = ChangePasswordDialog(self.root, self.vault_file, bytes(self.master_pwd))
@@ -577,10 +630,14 @@ class MilitaryMainWindow:
             messagebox.showinfo('成功', '主密码已更新')
 
     def lock(self):
+        """手动锁定，重置安全锁为正常状态，防止误报24小时"""
         if self._auto_lock_id: self.root.after_cancel(self._auto_lock_id)
         self.remove_auto_lock_bindings()
         self.save()
-        audit_log('锁定', self.audit_key)
+        update_lock_file(self.vault_file, 0, 0,
+                         self.data.get('settings', {}).get('max_attempts', DEFAULT_MAX_ATTEMPTS),
+                         self.data.get('settings', {}).get('on_max_action', DEFAULT_ON_MAX_ACTION))
+        audit_log('手动锁定', self.audit_key)
         secure_wipe(self.master_pwd)
         self.master_pwd = None; self.data = None; self.audit_key = None
         self.root.destroy()
@@ -588,7 +645,7 @@ class MilitaryMainWindow:
         self.parent.wait_window(login.win)
         if login.master_pwd and login.data:
             MilitaryMainWindow(self.parent, self.vault_file, login.data, login.master_pwd,
-                               login.audit_key, getattr(login,'mlock_ok',False), self.running_lock)
+                               login.audit_key, getattr(login,'mlock_ok',False))
         else:
             self.on_exit()
 
@@ -601,15 +658,45 @@ class MilitaryMainWindow:
 
     def on_exit(self):
         if self.master_pwd: secure_wipe(self.master_pwd)
-        release_running_lock(self.running_lock)
+        release_running_lock(running_lock_global)   # 使用全局运行锁句柄
         self.parent.destroy()
 
-# ======================== 对话窗 ========================
+# -------------------- 安全设置对话框 --------------------
+class SecuritySettingsDialog(tk.Toplevel):
+    def __init__(self, parent, vault_file):
+        super().__init__(parent)
+        self.title('安全设置'); self.resizable(False, False)
+        self.vault_file = vault_file
+        set_icon(self)
+        lock_state = load_lock_state(vault_file)
+        _, _, cur_max, cur_action = lock_state
+        self.max_attempts_var = tk.IntVar(value=cur_max)
+        self.action_var = tk.StringVar(value=cur_action)
+        ttk.Label(self, text='最大错误次数 (1-20):').pack(pady=2)
+        ttk.Spinbox(self, from_=1, to=20, textvariable=self.max_attempts_var, width=5).pack(pady=2)
+        ttk.Label(self, text='达到上限后的动作:').pack(pady=2)
+        ttk.Radiobutton(self, text='锁定（指定分钟）', variable=self.action_var, value='lock').pack(anchor='w')
+        ttk.Radiobutton(self, text='永久销毁保险库', variable=self.action_var, value='destroy').pack(anchor='w')
+        ttk.Label(self, text='锁定分钟数 (仅锁定模式):').pack(pady=2)
+        self.lockout_var = tk.IntVar(value=DEFAULT_LOCKOUT_TIME)
+        ttk.Spinbox(self, from_=1, to=1440, textvariable=self.lockout_var, width=5).pack(pady=2)
+        bf = ttk.Frame(self); bf.pack(pady=10)
+        ttk.Button(bf, text='保存', command=self.save).pack(side='left', padx=4)
+        ttk.Button(bf, text='取消', command=self.destroy).pack(side='left', padx=4)
+        center_window(self, parent, 300, 230)
+
+    def save(self):
+        new_max = self.max_attempts_var.get()
+        new_action = self.action_var.get()
+        update_lock_file(self.vault_file, 0, 0, new_max, new_action)
+        messagebox.showinfo('成功', '安全设置已更新。')
+        self.destroy()
+
+# -------------------- 对话窗 --------------------
 class EntryDialog(tk.Toplevel):
     def __init__(self, parent, title, site='', username='', password=''):
         super().__init__(parent)
-        self.title(title); self.resizable(False, False); self.result = None
-        set_icon(self)
+        self.title(title); self.resizable(False, False); self.result = None; set_icon(self)
         ttk.Label(self, text='网站/应用:').pack(pady=2)
         self.site_var = tk.StringVar(value=site); ttk.Entry(self, textvariable=self.site_var, width=30).pack()
         ttk.Label(self, text='用户名:').pack(pady=2)
@@ -617,8 +704,7 @@ class EntryDialog(tk.Toplevel):
         ttk.Label(self, text='密码:').pack(pady=2)
         pf = ttk.Frame(self); pf.pack()
         self.pwd_var = tk.StringVar(value=password)
-        self.pwd_entry = ttk.Entry(pf, textvariable=self.pwd_var, width=24, show='*')
-        self.pwd_entry.pack(side='left')
+        self.pwd_entry = ttk.Entry(pf, textvariable=self.pwd_var, width=24, show='*'); self.pwd_entry.pack(side='left')
         self.show_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(pf, text='👁', variable=self.show_var, command=self.toggle_show, width=3).pack(side='left')
         ttk.Button(pf, text='生成', command=self.generate_pwd).pack(side='left', padx=4)
@@ -664,8 +750,7 @@ class ChangePasswordDialog(tk.Toplevel):
     def __init__(self, parent, vault_file, current_password: bytes):
         super().__init__(parent)
         self.title('修改主密码'); self.resizable(False, False); self.new_password = None
-        self.vault_file = vault_file; self.current_password = current_password
-        set_icon(self)
+        self.vault_file = vault_file; self.current_password = current_password; set_icon(self)
         ttk.Label(self, text='原密码:').pack()
         self.old_var = tk.StringVar(); ttk.Entry(self, textvariable=self.old_var, show='*').pack()
         ttk.Label(self, text='新密码 (至少8位):').pack()
@@ -685,15 +770,21 @@ class ChangePasswordDialog(tk.Toplevel):
             messagebox.showwarning('错误','原密码错误'); return
         self.new_password = new; self.destroy()
 
-# ======================== 主入口 ========================
+# -------------------- 主入口（安全锁检测 + 运行锁） --------------------
 if __name__ == '__main__':
     root = tk.Tk()
     root.withdraw()
-
     vault_file = 'vault.pass'
-    running_lock = acquire_running_lock(vault_file)
-    if running_lock is None:
-        messagebox.showerror('错误', '程序已在运行中，不能同时打开两个实例。')
+
+    # 安全检测：保险库存在但安全锁文件缺失 → 强制锁定并退出
+    if os.path.exists(vault_file) and not os.path.exists(LOCK_FILE):
+        messagebox.showerror('安全警告', '安全锁文件丢失，保险库已锁定24小时。')
+        sys.exit(1)
+
+    # 获取运行锁（独立文件，自动回收残留锁）
+    running_lock_global = acquire_running_lock()
+    if running_lock_global is None:
+        messagebox.showerror('错误', '程序已在运行中，请先关闭其他 LynPass 窗口。')
         sys.exit(1)
 
     login = MilitaryLoginWindow(root, vault_file)
@@ -701,8 +792,8 @@ if __name__ == '__main__':
 
     if login.master_pwd is not None and login.data is not None:
         MilitaryMainWindow(root, vault_file, login.data, login.master_pwd,
-                           login.audit_key, getattr(login, 'mlock_ok', False), running_lock)
+                           login.audit_key, getattr(login, 'mlock_ok', False))
         root.mainloop()
     else:
-        release_running_lock(running_lock)
+        release_running_lock(running_lock_global)
         sys.exit()
