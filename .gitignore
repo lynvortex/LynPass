@@ -1,0 +1,33 @@
+# LynPass .gitignore
+
+# 运行时生成的文件（敏感数据）
+vault.pass
+.vault.lock
+audit.log.enc
+vault.pass.running
+
+# 临时文件
+*.tmp
+
+# 编译产物
+*.pyc
+__pycache__/
+*.spec
+build/
+dist/
+
+# 预编译可执行文件（体积大，建议单独发布）
+*.exe
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Reasonix 工作元数据
+.reasonix/
